@@ -2,10 +2,28 @@ package main
 
 import (
 	"fmt"
+
 	"rotten-onion-tor/tor"
 )
 
 func main() {
-	authority := tor.GetRandomAuthority()
-	fmt.Println(authority.Nickname)
+	client, err := tor.NewClient(3)
+	if err != nil {
+		panic(err)
+	}
+
+	relay := client.GetRandomOnionRelay()
+	guard := client.GetRandomGuardRelay()
+	exit := client.GetRandomExitRelay()
+
+	fmt.Println("Random Onion Relay:", relay.Nickname)
+	fmt.Println("Random Guard Relay:", guard.Nickname)
+	fmt.Println("Random Exit Relay:", exit.Nickname)
+
+	err = exit.UpdateNTorKey(client.Authority)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("Random Exit Relay NTorKey:", exit.NTorKey)
 }

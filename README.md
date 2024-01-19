@@ -3,8 +3,8 @@ Minimal Tor client written with Go
 
 ### TODO
 - [ ] Circuit Management
-  - [ ] Consensus and descriptor parser
-  - [ ] TAP/NTor handshake
+  - [x] Consensus and descriptor parser
+  - [ ] NTor handshake
   - [ ] NTor v3 handshake
 - [ ] Hidden service support
   - [ ] Introduction protocol

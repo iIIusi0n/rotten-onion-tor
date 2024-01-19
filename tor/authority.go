@@ -3,9 +3,73 @@ package tor
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
 	"math/big"
+
 	"rotten-onion-tor/utils"
 )
+
+type Authority struct {
+	Nickname string
+	IP       string
+	DirPort  int
+}
+
+func NewAuthority(nickname, ip string, dirPort int) *Authority {
+	return &Authority{
+		nickname,
+		ip,
+		dirPort,
+	}
+}
+
+func (a *Authority) getConsensusURL() string {
+	return fmt.Sprintf("http://%s:%d/tor/status-vote/current/consensus", a.IP, a.DirPort)
+}
+
+func (a *Authority) getConsensusContent() (string, error) {
+	log.Println("Downloading consensus from", a.Nickname)
+
+	url := a.getConsensusURL()
+
+	log.Println("Consensus URL:", url)
+
+	return utils.DownloadStringFromURL(url)
+}
+
+func (a *Authority) GetOnionRouters() ([]OnionRouter, error) {
+	content, err := a.getConsensusContent()
+	if err != nil {
+		log.Fatalln(err)
+
+		return nil, err
+	}
+
+	log.Println("Consensus length:", len(content))
+
+	return parseConsensus(content)
+}
+
+func (a *Authority) getRouterDescriptorURL(router *OnionRouter) string {
+	return fmt.Sprintf("http://%s:%d/tor/server/fp/%s", a.IP, a.DirPort, router.Identity)
+}
+
+func (a *Authority) getRouterDescriptorContent(router *OnionRouter) (string, error) {
+	url := a.getRouterDescriptorURL(router)
+
+	return utils.DownloadStringFromURL(url)
+}
+
+func (a *Authority) GetOnionRouterNTorKey(router *OnionRouter) (string, error) {
+	content, err := a.getRouterDescriptorContent(router)
+	if err != nil {
+		log.Fatalln(err)
+
+		return "", err
+	}
+
+	return parseRouterDescriptor(content)
+}
 
 var (
 	Authorities = []Authority{
@@ -28,28 +92,4 @@ func GetRandomAuthority() *Authority {
 	}
 
 	return &Authorities[n.Int64()]
-}
-
-type Authority struct {
-	Nickname string
-	IP       string
-	Port     int
-}
-
-func NewAuthority(nickname, ip string, port int) *Authority {
-	return &Authority{
-		nickname,
-		ip,
-		port,
-	}
-}
-
-func (a *Authority) getConsensusURL() string {
-	return fmt.Sprintf("http://%s:%d/tor/status-vote/current/consensus", a.IP, a.Port)
-}
-
-func (a *Authority) getConsensusContent() (string, error) {
-	url := a.getConsensusURL()
-
-	return utils.DownloadStringFromURL(url)
 }
