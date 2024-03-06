@@ -53,6 +53,9 @@ func parseConsensus(content string) ([]OnionRouter, error) {
 			identity += strings.Repeat("=", 4-len(identity)%4)
 			identity = utils.Base64ToHex(identity)
 
+			digest += strings.Repeat("=", 4-len(digest)%4)
+			digest = utils.Base64ToHex(digest)
+
 			lastOnionRouter = *NewOnionRouterWithoutDetail(nickname, identity, digest, ip, orPort, dirPort)
 		} else if strings.HasPrefix(line, "s ") {
 			if lastOnionRouter.Nickname == "" {

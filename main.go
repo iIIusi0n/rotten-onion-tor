@@ -20,10 +20,10 @@ func main() {
 	fmt.Println("Random Guard Relay:", guard.Nickname)
 	fmt.Println("Random Exit Relay:", exit.Nickname)
 
-	err = exit.UpdateNTorKey(client.Authority)
+	nTorKey, err := exit.FetchNTorKey(client.Authority)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println("Random Exit Relay NTorKey:", exit.NTorKey)
+	fmt.Println("Random Exit Relay NTorKey:", nTorKey)
 }

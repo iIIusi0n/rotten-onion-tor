@@ -8,11 +8,10 @@ type OnionRouter struct {
 	OrPort   int
 	DirPort  int
 
-	Flags   []string
-	NTorKey string
+	Flags []string
 }
 
-func NewOnionRouter(nickname, identity, digest, ip string, orPort, dirPort int, flags []string, nTorKey string) *OnionRouter {
+func NewOnionRouter(nickname, identity, digest, ip string, orPort, dirPort int, flags []string) *OnionRouter {
 	return &OnionRouter{
 		nickname,
 		identity,
@@ -21,22 +20,20 @@ func NewOnionRouter(nickname, identity, digest, ip string, orPort, dirPort int, 
 		orPort,
 		dirPort,
 		flags,
-		nTorKey,
 	}
 }
 
 func NewOnionRouterWithoutDetail(nickname, identity, digest, ip string, orPort, dirPort int) *OnionRouter {
-	return NewOnionRouter(nickname, identity, digest, ip, orPort, dirPort, nil, "")
+	return NewOnionRouter(nickname, identity, digest, ip, orPort, dirPort, nil)
 }
 
-func (o *OnionRouter) UpdateNTorKey(authority *Authority) error {
+func (o *OnionRouter) FetchNTorKey(authority *Authority) (string, error) {
 	nTorKey, err := authority.GetOnionRouterNTorKey(o)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	o.NTorKey = nTorKey
-	return nil
+	return nTorKey, nil
 }
 
 func (o *OnionRouter) HasFlag(flag string) bool {

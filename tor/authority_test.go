@@ -30,5 +30,6 @@ func TestAuthority_GetOnionRouters(t *testing.T) {
 	t.Log("Onion router #3:", onionRouters[2].Nickname)
 
 	t.Log("Onion router #1 Identity:", onionRouters[0].Identity)
+	t.Log("Onion router #1 Digest:", onionRouters[0].Digest)
 	t.Log("Onion router #1 Flags:", onionRouters[0].Flags)
 }

@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"net/url"
 )
@@ -34,6 +35,10 @@ func DownloadStringFromURL(addr string) (string, error) {
 		}
 
 		body = append(body, buf[:n]...)
+	}
+
+	if len(body) == 0 {
+		return "", fmt.Errorf("no content")
 	}
 
 	body = body[bytes.Index(body, []byte("\r\n\r\n"))+4:]
