@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -243,17 +244,8 @@ func buildRendezvousCircuit(consensus *directory.Consensus, logger *log.Logger) 
 		guard.Nickname, middle.Nickname, rendPoint.Nickname)
 
 	// Fetch descriptors for ntor keys.
-	auth := directory.DefaultAuthorities[0]
-	for _, router := range []*directory.Router{guard, middle, rendPoint} {
-		if router.NtorOnionKey == nil {
-			if err := directory.FetchMicrodescriptors(auth, []*directory.Router{router}); err != nil {
-				for _, a := range directory.DefaultAuthorities[1:] {
-					if err2 := directory.FetchMicrodescriptors(a, []*directory.Router{router}); err2 == nil {
-						break
-					}
-				}
-			}
-		}
+	if err := ensureNtorKeys(guard, middle, rendPoint); err != nil {
+		return nil, nil, fmt.Errorf("fetch relay ntor keys: %w", err)
 	}
 
 	// Connect and build circuit.
@@ -317,7 +309,14 @@ func doIntroduction(
 	// Plaintext: RENDEZVOUS_COOKIE(20) || N_EXTENSIONS(1) || ONION_KEY_TYPE(1) ||
 	//   ONION_KEY_LEN(2) || ONION_KEY(32) || NSPEC(1) || link_specifiers || PAD
 	rendNtorKey := rendRouter.NtorOnionKey
-	rendLinkSpecs := buildRendLinkSpecs(rendRouter)
+	if len(rendNtorKey) != 32 {
+		return nil, nil, fmt.Errorf("invalid rendezvous ntor key length: %d", len(rendNtorKey))
+	}
+
+	rendLinkSpecs, err := buildRendLinkSpecs(rendRouter)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build rendezvous link specifiers: %w", err)
+	}
 
 	innerPlaintext := make([]byte, 0, 256)
 	innerPlaintext = append(innerPlaintext, rendCookie...) // 20 bytes
@@ -358,8 +357,8 @@ func doIntroduction(
 	encryptedPart = append(encryptedPart, clientPK...) // CLIENT_PK = X
 	encryptedPart = append(encryptedPart, encrypted...)
 
-	// MAC covers: intro1Body (from AUTH_KEY_TYPE onwards... actually the full cell from beginning)
-	// Per spec: MAC = MAC(MAC_KEY, msg) where msg is everything in the cell up to MAC.
+	// MAC covers everything up to MAC itself: H || X || C.
+	// Here H includes LEGACY_KEY_ID and the auth key header.
 	macMsg := make([]byte, 0, len(intro1Body)+len(encryptedPart))
 	macMsg = append(macMsg, intro1Body...)
 	macMsg = append(macMsg, encryptedPart...)
@@ -384,12 +383,13 @@ func doIntroduction(
 		return nil, nil, fmt.Errorf("expected INTRODUCE_ACK, got %d", rc.Command)
 	}
 
-	// Check ACK status (first 2 bytes, 0x0000 = success).
-	if len(rc.Data) >= 2 {
-		status := binary.BigEndian.Uint16(rc.Data[0:2])
-		if status != 0 {
-			return nil, nil, fmt.Errorf("INTRODUCE_ACK status: %d", status)
-		}
+	// Check ACK status (2 bytes, 0x0000 = success).
+	if len(rc.Data) < 2 {
+		return nil, nil, fmt.Errorf("INTRODUCE_ACK too short: %d", len(rc.Data))
+	}
+	status := binary.BigEndian.Uint16(rc.Data[0:2])
+	if status != 0 {
+		return nil, nil, fmt.Errorf("INTRODUCE_ACK status: %d", status)
 	}
 	logger.Printf("[HS] Introduction acknowledged (success)")
 
@@ -406,17 +406,8 @@ func buildIntroCircuit(consensus *directory.Consensus, ip *IntroPoint, logger *l
 	}
 
 	// Fetch descriptors.
-	auth := directory.DefaultAuthorities[0]
-	for _, router := range []*directory.Router{guard, middle} {
-		if router.NtorOnionKey == nil {
-			if err := directory.FetchMicrodescriptors(auth, []*directory.Router{router}); err != nil {
-				for _, a := range directory.DefaultAuthorities[1:] {
-					if err2 := directory.FetchMicrodescriptors(a, []*directory.Router{router}); err2 == nil {
-						break
-					}
-				}
-			}
-		}
+	if err := ensureNtorKeys(guard, middle); err != nil {
+		return nil, fmt.Errorf("fetch relay ntor keys: %w", err)
 	}
 
 	addr := fmt.Sprintf("%s:%d", guard.Address, guard.ORPort)
@@ -471,9 +462,12 @@ func extractNodeID(specs []LinkSpecifier) torcrypto.NodeID {
 }
 
 // buildRendLinkSpecs builds link specifiers for the rendezvous point.
-func buildRendLinkSpecs(router *directory.Router) []byte {
+func buildRendLinkSpecs(router *directory.Router) ([]byte, error) {
 	// Build link specifiers: IPv4 (type 0) + legacy identity (type 2).
-	ip := parseIPv4(router.Address)
+	ip, err := parseIPv4(router.Address)
+	if err != nil {
+		return nil, err
+	}
 
 	specs := make([]byte, 0, 64)
 	specs = append(specs, 2) // NSPEC = 2
@@ -486,34 +480,42 @@ func buildRendLinkSpecs(router *directory.Router) []byte {
 	specs = append(specs, portBuf...)
 
 	// Legacy identity spec.
-	identityHash := decodeIdentityHash(router.Identity)
+	identityHash, err := decodeIdentityHash(router.Identity)
+	if err != nil {
+		return nil, err
+	}
 	specs = append(specs, 0x02, 20)
 	specs = append(specs, identityHash...)
 
-	return specs
+	return specs, nil
 }
 
-func parseIPv4(addr string) []byte {
-	ip := make([]byte, 4)
-	var a, b, c, d int
-	fmt.Sscanf(addr, "%d.%d.%d.%d", &a, &b, &c, &d)
-	ip[0] = byte(a)
-	ip[1] = byte(b)
-	ip[2] = byte(c)
-	ip[3] = byte(d)
-	return ip
-}
-
-func decodeIdentityHash(identity string) []byte {
-	padded := identity
-	for len(padded)%4 != 0 {
-		padded += "="
+func parseIPv4(addr string) ([]byte, error) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP address: %q", addr)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(padded)
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return nil, fmt.Errorf("expected IPv4 address, got: %q", addr)
+	}
+	out := make([]byte, 4)
+	copy(out, ipv4)
+	return out, nil
+}
+
+func decodeIdentityHash(identity string) ([]byte, error) {
+	decoded, err := base64.RawStdEncoding.DecodeString(identity)
 	if err != nil {
-		return make([]byte, 20)
+		decoded, err = base64.StdEncoding.DecodeString(identity)
+		if err != nil {
+			return nil, fmt.Errorf("decode identity hash: %w", err)
+		}
 	}
-	return decoded
+	if len(decoded) != 20 {
+		return nil, fmt.Errorf("identity hash length %d, want 20", len(decoded))
+	}
+	return decoded, nil
 }
 
 // fetchDescriptorViaCircuit builds a 3-hop circuit to an HSDir and fetches
@@ -521,15 +523,8 @@ func decodeIdentityHash(identity string) []byte {
 // requests, so we must use a multi-hop circuit.
 func fetchDescriptorViaCircuit(consensus *directory.Consensus, hsdir *directory.Router, blindedKey []byte, logger *log.Logger) (string, error) {
 	// Fetch ntor key for the HSDir if needed.
-	if hsdir.NtorOnionKey == nil {
-		for _, auth := range directory.DefaultAuthorities {
-			if err := directory.FetchMicrodescriptors(auth, []*directory.Router{hsdir}); err == nil && hsdir.NtorOnionKey != nil {
-				break
-			}
-		}
-		if hsdir.NtorOnionKey == nil {
-			return "", fmt.Errorf("could not fetch ntor key for %s", hsdir.Nickname)
-		}
+	if err := ensureNtorKeys(hsdir); err != nil {
+		return "", err
 	}
 
 	// Select guard and middle relays.
@@ -539,14 +534,8 @@ func fetchDescriptorViaCircuit(consensus *directory.Consensus, hsdir *directory.
 	}
 
 	// Fetch ntor keys for guard and middle.
-	for _, r := range []*directory.Router{guard, middle} {
-		if r.NtorOnionKey == nil {
-			for _, auth := range directory.DefaultAuthorities {
-				if err := directory.FetchMicrodescriptors(auth, []*directory.Router{r}); err == nil && r.NtorOnionKey != nil {
-					break
-				}
-			}
-		}
+	if err := ensureNtorKeys(guard, middle); err != nil {
+		return "", fmt.Errorf("fetch relay ntor keys: %w", err)
 	}
 
 	// Build 3-hop circuit: guard -> middle -> HSDir.
@@ -650,4 +639,35 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func ensureNtorKeys(routers ...*directory.Router) error {
+	for _, r := range routers {
+		if r == nil {
+			return fmt.Errorf("router is nil")
+		}
+		if len(r.NtorOnionKey) == 32 {
+			continue
+		}
+
+		var lastErr error
+		for _, auth := range directory.DefaultAuthorities {
+			if err := directory.FetchMicrodescriptors(auth, []*directory.Router{r}); err != nil {
+				lastErr = err
+				continue
+			}
+			if len(r.NtorOnionKey) == 32 {
+				break
+			}
+		}
+
+		if len(r.NtorOnionKey) != 32 {
+			if lastErr != nil {
+				return fmt.Errorf("fetch ntor key for %s: %w", r.Nickname, lastErr)
+			}
+			return fmt.Errorf("fetch ntor key for %s: key missing after descriptor fetch", r.Nickname)
+		}
+	}
+
+	return nil
 }

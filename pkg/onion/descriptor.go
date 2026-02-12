@@ -3,6 +3,7 @@ package onion
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -31,6 +32,13 @@ type HSDescriptor struct {
 	Superencrypted  []byte // Raw superencrypted blob
 	SigningKeyCert  []byte
 }
+
+const (
+	ed25519CertV1LenMin           = 39
+	ed25519CertVersion            = 1
+	ed25519CertTypeHSIntroAuthKey = 9
+	ed25519CertKeyTypeEd25519     = 1
+)
 
 // ParseHSDescriptorOuter parses the outer wrapper of an HS descriptor.
 func ParseHSDescriptorOuter(body string) (*HSDescriptor, error) {
@@ -201,7 +209,9 @@ func ParseIntroPoints(plaintext []byte) ([]*IntroPoint, error) {
 		switch {
 		case strings.HasPrefix(line, "introduction-point "):
 			if current != nil {
-				introPoints = append(introPoints, current)
+				if isCompleteIntroPoint(current) {
+					introPoints = append(introPoints, current)
+				}
 			}
 			current = &IntroPoint{}
 			// Parse link specifiers from base64.
@@ -249,18 +259,11 @@ func ParseIntroPoints(plaintext []byte) ([]*IntroPoint, error) {
 
 		case line == "-----END ED25519 CERT-----":
 			if current != nil && inAuthKey {
-				certBytes, err := base64.StdEncoding.DecodeString(authKeyB64.String())
-				if err == nil {
-					// Extract the certified key from the ed25519 cert.
-					// The cert format has the key at bytes [39:71] for a v1 cert.
-					// More precisely: version(1) + cert_type(1) + expiration(4) +
-					// key_type(1) + certified_key(32) = key starts at offset 7+32=39
-					// Actually the format is:
-					// VERSION(1) CERT_TYPE(1) EXPIRATION_DATE(4) KEY_TYPE(1) CERTIFIED_KEY(32) ...
-					if len(certBytes) >= 39 {
-						current.AuthKey = certBytes[7:39]
-					}
+				authKey, err := parseAuthKeyFromEd25519Cert(authKeyB64.String())
+				if err != nil {
+					return nil, fmt.Errorf("parse intro auth-key cert: %w", err)
 				}
+				current.AuthKey = authKey
 			}
 			inAuthKey = false
 
@@ -272,7 +275,9 @@ func ParseIntroPoints(plaintext []byte) ([]*IntroPoint, error) {
 	}
 
 	if current != nil {
-		introPoints = append(introPoints, current)
+		if isCompleteIntroPoint(current) {
+			introPoints = append(introPoints, current)
+		}
 	}
 
 	return introPoints, nil
@@ -304,6 +309,9 @@ func parseLinkSpecifiers(data []byte) ([]LinkSpecifier, error) {
 		copy(spec.Data, data[off:off+lslen])
 		off += lslen
 		specs = append(specs, spec)
+	}
+	if off != len(data) {
+		return nil, fmt.Errorf("unexpected trailing bytes in link specifiers")
 	}
 	return specs, nil
 }
@@ -341,13 +349,38 @@ func base64DecodeFlexible(s string) ([]byte, error) {
 }
 
 func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
+	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+func isCompleteIntroPoint(ip *IntroPoint) bool {
+	if ip == nil {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+	return len(ip.LinkSpecifiers) > 0 &&
+		len(ip.OnionKey) == 32 &&
+		len(ip.EncKey) == 32 &&
+		len(ip.AuthKey) == 32
+}
+
+func parseAuthKeyFromEd25519Cert(certB64 string) ([]byte, error) {
+	certBytes, err := base64DecodeFlexible(certB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode cert: %w", err)
 	}
-	return true
+	if len(certBytes) < ed25519CertV1LenMin {
+		return nil, fmt.Errorf("cert too short: %d", len(certBytes))
+	}
+	if certBytes[0] != ed25519CertVersion {
+		return nil, fmt.Errorf("unsupported cert version: %d", certBytes[0])
+	}
+	if certBytes[1] != ed25519CertTypeHSIntroAuthKey {
+		return nil, fmt.Errorf("unexpected cert type: %d", certBytes[1])
+	}
+	if certBytes[6] != ed25519CertKeyTypeEd25519 {
+		return nil, fmt.Errorf("unexpected cert key type: %d", certBytes[6])
+	}
+
+	key := make([]byte, 32)
+	copy(key, certBytes[7:39])
+	return key, nil
 }
