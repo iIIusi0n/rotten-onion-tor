@@ -4,9 +4,10 @@ package circuit
 
 import (
 	"crypto/rand"
-	"crypto/sha1"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"sync"
 
 	"rotten-onion-tor/pkg/cell"
@@ -63,7 +64,10 @@ func generateCircID() (uint32, error) {
 // Create sends a CREATE2 cell with an ntor handshake to the first relay
 // and processes the CREATED2 response.
 func (c *Circuit) Create(router *directory.Router) error {
-	nodeID := computeNodeID(router)
+	nodeID, err := computeNodeID(router)
+	if err != nil {
+		return fmt.Errorf("compute node ID: %w", err)
+	}
 
 	var ntorPK torcrypto.NtorPublicKey
 	copy(ntorPK[:], router.NtorOnionKey)
@@ -129,7 +133,10 @@ func (c *Circuit) Create(router *directory.Router) error {
 // Extend extends the circuit to an additional relay by sending an
 // EXTEND2 relay message through the existing circuit.
 func (c *Circuit) Extend(router *directory.Router) error {
-	nodeID := computeNodeID(router)
+	nodeID, err := computeNodeID(router)
+	if err != nil {
+		return fmt.Errorf("compute node ID: %w", err)
+	}
 
 	var ntorPK torcrypto.NtorPublicKey
 	copy(ntorPK[:], router.NtorOnionKey)
@@ -142,7 +149,10 @@ func (c *Circuit) Extend(router *directory.Router) error {
 	clientData := handshake.ClientHandshakeData()
 
 	// Build EXTEND2 relay message body.
-	extendBody := buildExtend2Body(router, clientData)
+	extendBody, err := buildExtend2Body(router, clientData)
+	if err != nil {
+		return fmt.Errorf("build EXTEND2 body: %w", err)
+	}
 
 	// Send as RELAY_EARLY cell with EXTEND2 command.
 	if err := c.sendRelayCell(cell.RelayExtend2, 0, extendBody, true); err != nil {
@@ -185,9 +195,12 @@ func (c *Circuit) Extend(router *directory.Router) error {
 	return nil
 }
 
-func buildExtend2Body(router *directory.Router, handshakeData []byte) []byte {
+func buildExtend2Body(router *directory.Router, handshakeData []byte) ([]byte, error) {
 	// Parse the router's IP address.
-	ip := parseIPv4(router.Address)
+	ip, err := parseIPv4(router.Address)
+	if err != nil {
+		return nil, fmt.Errorf("parse router IPv4 address: %w", err)
+	}
 
 	// Link specifiers: [00] IPv4 (6 bytes), [02] legacy identity (20 bytes)
 	// NSPEC(1) | [LSTYPE(1) LSLEN(1) LSPEC(LSLEN)] ... | HTYPE(2) | HLEN(2) | HDATA
@@ -202,7 +215,10 @@ func buildExtend2Body(router *directory.Router, handshakeData []byte) []byte {
 
 	// Spec 1: Legacy identity - SHA1 fingerprint (type 0x02, len 20)
 	// We compute this from the router's identity (base64-encoded in consensus).
-	identityHash := computeIdentityHash(router)
+	identityHash, err := computeIdentityHash(router)
+	if err != nil {
+		return nil, fmt.Errorf("decode legacy identity: %w", err)
+	}
 	spec1 := make([]byte, 22)
 	spec1[0] = 0x02 // type
 	spec1[1] = 20   // len
@@ -226,81 +242,61 @@ func buildExtend2Body(router *directory.Router, handshakeData []byte) []byte {
 	// HDATA
 	body = append(body, handshakeData...)
 
-	return body
+	return body, nil
 }
 
-func parseIPv4(addr string) []byte {
-	ip := make([]byte, 4)
-	var a, b, c, d int
-	fmt.Sscanf(addr, "%d.%d.%d.%d", &a, &b, &c, &d)
-	ip[0] = byte(a)
-	ip[1] = byte(b)
-	ip[2] = byte(c)
-	ip[3] = byte(d)
-	return ip
+func parseIPv4(addr string) ([]byte, error) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP address: %q", addr)
+	}
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return nil, fmt.Errorf("expected IPv4 address, got: %q", addr)
+	}
+	out := make([]byte, 4)
+	copy(out, ipv4)
+	return out, nil
 }
 
-func computeNodeID(router *directory.Router) torcrypto.NodeID {
+func computeNodeID(router *directory.Router) (torcrypto.NodeID, error) {
 	// The NodeID in ntor is SHA1(DER(RSA identity key)).
 	// In the consensus, the identity is a base64-encoded 20-byte SHA1 hash
 	// of the DER-encoded RSA identity key - this IS the NodeID.
 	var id torcrypto.NodeID
-	identityBytes := decodeIdentity(router.Identity)
+	identityBytes, err := decodeIdentity(router.Identity)
+	if err != nil {
+		return id, err
+	}
 	copy(id[:], identityBytes)
-	return id
+	return id, nil
 }
 
-func computeIdentityHash(router *directory.Router) [20]byte {
+func computeIdentityHash(router *directory.Router) ([20]byte, error) {
 	// The identity field in consensus is base64-encoded SHA1(DER(RSA_key)).
 	// For EXTEND2 link specifier, we need exactly this hash.
 	var hash [20]byte
-	identityBytes := decodeIdentity(router.Identity)
+	identityBytes, err := decodeIdentity(router.Identity)
+	if err != nil {
+		return hash, err
+	}
 	copy(hash[:], identityBytes)
-	return hash
+	return hash, nil
 }
 
-func decodeIdentity(identity string) []byte {
+func decodeIdentity(identity string) ([]byte, error) {
 	// Consensus identity is base64-encoded (without padding) 20-byte hash.
-	// Add padding if needed.
-	padded := identity
-	for len(padded)%4 != 0 {
-		padded += "="
-	}
-	decoded := make([]byte, 20)
-	n := 0
-	// Simple base64 decode.
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	for i := 0; i+3 < len(padded); i += 4 {
-		a := indexOf(alphabet, padded[i])
-		b := indexOf(alphabet, padded[i+1])
-		c_val := indexOf(alphabet, padded[i+2])
-		d := indexOf(alphabet, padded[i+3])
-		if a < 0 || b < 0 {
-			break
-		}
-		if n < len(decoded) {
-			decoded[n] = byte(a<<2 | b>>4)
-			n++
-		}
-		if c_val >= 0 && n < len(decoded) {
-			decoded[n] = byte((b&0xf)<<4 | c_val>>2)
-			n++
-		}
-		if d >= 0 && n < len(decoded) {
-			decoded[n] = byte((c_val&0x3)<<6 | d)
-			n++
+	decoded, err := base64.RawStdEncoding.DecodeString(identity)
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(identity)
+		if err != nil {
+			return nil, fmt.Errorf("decode identity: %w", err)
 		}
 	}
-	return decoded[:n]
-}
-
-func indexOf(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
+	if len(decoded) != torcrypto.NodeIDLen {
+		return nil, fmt.Errorf("identity length = %d, want %d", len(decoded), torcrypto.NodeIDLen)
 	}
-	return -1
+	return decoded, nil
 }
 
 func newHopCrypto(keys *torcrypto.CircuitKeys) (*HopCrypto, error) {
@@ -466,6 +462,16 @@ func (c *Circuit) SendRelayData(streamID uint16, data []byte) error {
 	return c.sendRelayCell(cell.RelayData, streamID, data, false)
 }
 
+// SendRelayEnd sends a RELAY_END cell with the given one-byte reason code.
+func (c *Circuit) SendRelayEnd(streamID uint16, reason byte) error {
+	return c.sendRelayCell(cell.RelayEnd, streamID, []byte{reason}, false)
+}
+
+// SendRelayStreamSendme sends a stream-level SENDME (empty body, non-zero stream ID).
+func (c *Circuit) SendRelayStreamSendme(streamID uint16) error {
+	return c.sendRelayCell(cell.RelaySendme, streamID, nil, false)
+}
+
 // SendRelayBegin sends a RELAY_BEGIN cell to open a stream.
 func (c *Circuit) SendRelayBegin(streamID uint16, addrPort string) error {
 	// Body: ADDRPORT\0 [FLAGS]
@@ -601,19 +607,4 @@ func (c *Circuit) ExtendRaw(linkSpecs []byte, ntorPK []byte, nodeID torcrypto.No
 
 	c.hops = append(c.hops, hop)
 	return nil
-}
-
-// computeNodeIDFromFingerprint computes the NodeID from a hex fingerprint.
-// This is used when the hex fingerprint is available directly.
-func computeNodeIDFromFingerprint(fingerprint string) torcrypto.NodeID {
-	var id torcrypto.NodeID
-	// SHA1 of DER-encoded RSA key IS the fingerprint.
-	// The consensus gives us base64 of the fingerprint directly.
-	_ = fingerprint
-	return id
-}
-
-// Helper to compute SHA1.
-func sha1Hash(data []byte) [20]byte {
-	return sha1.Sum(data)
 }

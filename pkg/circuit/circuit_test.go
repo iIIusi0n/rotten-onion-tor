@@ -42,7 +42,10 @@ func TestParseIPv4(t *testing.T) {
 		{"0.0.0.0", []byte{0, 0, 0, 0}},
 	}
 	for _, tt := range tests {
-		got := parseIPv4(tt.addr)
+		got, err := parseIPv4(tt.addr)
+		if err != nil {
+			t.Fatalf("parseIPv4(%q): %v", tt.addr, err)
+		}
 		if !bytes.Equal(got, tt.want) {
 			t.Errorf("parseIPv4(%q) = %v, want %v", tt.addr, got, tt.want)
 		}
@@ -53,7 +56,10 @@ func TestDecodeIdentity(t *testing.T) {
 	// Test with known base64-encoded identity (27 chars = 20 bytes).
 	// "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" is base64 for 20 zero bytes + extra.
 	identity := "AAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	decoded := decodeIdentity(identity)
+	decoded, err := decodeIdentity(identity)
+	if err != nil {
+		t.Fatalf("decodeIdentity: %v", err)
+	}
 	if len(decoded) != 20 {
 		t.Fatalf("decoded length = %d, want 20", len(decoded))
 	}
@@ -69,7 +75,10 @@ func TestBuildExtend2Body(t *testing.T) {
 	router := testRouter()
 
 	handshakeData := bytes.Repeat([]byte{0xAB}, 84) // ntor handshake = 84 bytes
-	body := buildExtend2Body(router, handshakeData)
+	body, err := buildExtend2Body(router, handshakeData)
+	if err != nil {
+		t.Fatalf("buildExtend2Body: %v", err)
+	}
 
 	if len(body) == 0 {
 		t.Fatal("empty extend2 body")
@@ -132,7 +141,10 @@ func testRouter() *directory.Router {
 
 func TestComputeNodeID(t *testing.T) {
 	router := testRouter()
-	nodeID := computeNodeID(router)
+	nodeID, err := computeNodeID(router)
+	if err != nil {
+		t.Fatalf("computeNodeID: %v", err)
+	}
 	if len(nodeID) != 20 {
 		t.Errorf("nodeID length = %d, want 20", len(nodeID))
 	}
