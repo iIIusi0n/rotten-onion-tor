@@ -289,8 +289,9 @@ func (c *Client) HTTPGetOnion(onionURL string) (string, error) {
 
 	c.logger.Printf("[*] Opening stream to %s:%s...", host, port)
 
-	// Open stream via the HS circuit.
-	s, err := mgr.OpenStream(fmt.Sprintf("%s:%s", host, port))
+	// Onion rendezvous streams use an empty host target (":port").
+	// Spec: rend-spec-v3 "Managing streams", step 2.
+	s, err := mgr.OpenStream(":" + port)
 	if err != nil {
 		return "", fmt.Errorf("open stream: %w", err)
 	}
