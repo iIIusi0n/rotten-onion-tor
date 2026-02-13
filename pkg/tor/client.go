@@ -17,6 +17,8 @@ import (
 	"rotten-onion-tor/pkg/stream"
 )
 
+const ioTimeout = 90 * time.Second
+
 // Client is a high-level Tor client.
 type Client struct {
 	consensus *directory.Consensus
@@ -142,7 +144,7 @@ func (c *Client) HTTPGet(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer circ.Destroy()
+	defer circ.Close()
 
 	_ = info
 
@@ -168,7 +170,7 @@ func (c *Client) httpGetPlain(s *stream.Stream, mgr *stream.Manager, host, path 
 	// Send HTTP request.
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
 	c.logger.Printf("[*] Sending HTTP request...")
-	if _, err := s.Write(mgr, []byte(req)); err != nil {
+	if _, err := s.WriteWithDeadline(mgr, []byte(req), time.Now().Add(ioTimeout)); err != nil {
 		return "", fmt.Errorf("write request: %w", err)
 	}
 
@@ -185,6 +187,7 @@ func (c *Client) httpGetTLS(s *stream.Stream, mgr *stream.Manager, host, path st
 		ServerName: host,
 	}
 	tlsConn := tls.Client(streamConn, tlsConfig)
+	_ = tlsConn.SetDeadline(time.Now().Add(ioTimeout))
 	if err := tlsConn.Handshake(); err != nil {
 		return "", fmt.Errorf("TLS handshake: %w", err)
 	}
@@ -193,6 +196,7 @@ func (c *Client) httpGetTLS(s *stream.Stream, mgr *stream.Manager, host, path st
 	// Send HTTP request over TLS.
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
 	c.logger.Printf("[*] Sending HTTPS request...")
+	_ = tlsConn.SetWriteDeadline(time.Now().Add(ioTimeout))
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		return "", fmt.Errorf("write request: %w", err)
 	}
@@ -201,6 +205,7 @@ func (c *Client) httpGetTLS(s *stream.Stream, mgr *stream.Manager, host, path st
 	var response strings.Builder
 	buf := make([]byte, 4096)
 	for {
+		_ = tlsConn.SetReadDeadline(time.Now().Add(ioTimeout))
 		n, err := tlsConn.Read(buf)
 		if n > 0 {
 			response.Write(buf[:n])
@@ -221,7 +226,7 @@ func (c *Client) readHTTPResponse(s *stream.Stream, mgr *stream.Manager) (string
 	var response strings.Builder
 	buf := make([]byte, 4096)
 	for {
-		n, err := s.Read(mgr, buf)
+		n, err := s.ReadWithDeadline(mgr, buf, time.Now().Add(ioTimeout))
 		if n > 0 {
 			response.Write(buf[:n])
 		}
@@ -285,7 +290,7 @@ func (c *Client) HTTPGetOnion(onionURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("connect to onion: %w", err)
 	}
-	defer circ.Destroy()
+	defer circ.Close()
 
 	c.logger.Printf("[*] Opening stream to %s:%s...", host, port)
 
