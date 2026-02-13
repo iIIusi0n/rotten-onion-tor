@@ -2,6 +2,7 @@ package directory
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/sha256"
@@ -72,6 +73,14 @@ type Consensus struct {
 // FetchConsensus downloads the microdescriptor consensus from a directory authority.
 // This gives us microdescriptor digests for batch-fetching ntor keys and ed25519 identities.
 func FetchConsensus(authority DirectoryAuthority) (*Consensus, error) {
+	body, err := fetchConsensusBody(authority)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConsensus(bytes.NewReader(body))
+}
+
+func fetchConsensusBody(authority DirectoryAuthority) ([]byte, error) {
 	url := fmt.Sprintf("http://%s:%d/tor/status-vote/current/consensus-microdesc",
 		authority.Address, authority.DirPort)
 
@@ -87,9 +96,11 @@ func FetchConsensus(authority DirectoryAuthority) (*Consensus, error) {
 	}
 
 	// Handle compressed responses.
-	body := decompressBody(resp)
-
-	return ParseConsensus(body)
+	body, err := io.ReadAll(decompressBody(resp))
+	if err != nil {
+		return nil, fmt.Errorf("read consensus from %s: %w", authority.Name, err)
+	}
+	return body, nil
 }
 
 // FetchConsensusFromAny tries to load a cached consensus from disk first.
@@ -102,21 +113,51 @@ func FetchConsensusFromAny() (*Consensus, error) {
 		return cached, nil
 	}
 
+	type candidate struct {
+		consensus *Consensus
+		count     int
+	}
+
+	const requiredAuthorityAgreement = 2
+	candidates := make(map[[32]byte]*candidate)
 	var lastErr error
+
 	for _, auth := range DefaultAuthorities {
-		consensus, err := FetchConsensus(auth)
+		body, err := fetchConsensusBody(auth)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if err := SaveConsensus(consensus); err != nil {
-			fmt.Printf("[cache] Warning: could not save consensus: %v\n", err)
-		} else {
-			fmt.Printf("[cache] Saved consensus to disk (%d routers)\n", len(consensus.Routers))
+
+		digest := sha256.Sum256(body)
+		c, ok := candidates[digest]
+		if !ok {
+			consensus, err := ParseConsensus(bytes.NewReader(body))
+			if err != nil {
+				lastErr = fmt.Errorf("parse consensus from %s: %w", auth.Name, err)
+				continue
+			}
+			c = &candidate{consensus: consensus}
+			candidates[digest] = c
 		}
-		return consensus, nil
+		c.count++
+
+		if c.count >= requiredAuthorityAgreement {
+			if err := SaveConsensus(c.consensus); err != nil {
+				fmt.Printf("[cache] Warning: could not save consensus: %v\n", err)
+			} else {
+				fmt.Printf("[cache] Saved consensus to disk (%d routers)\n", len(c.consensus.Routers))
+			}
+			return c.consensus, nil
+		}
 	}
-	return nil, fmt.Errorf("failed to fetch consensus from any authority: %w", lastErr)
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to fetch consensus quorum (%d matching authorities required): %w",
+			requiredAuthorityAgreement, lastErr)
+	}
+	return nil, fmt.Errorf("failed to fetch consensus quorum (%d matching authorities required)",
+		requiredAuthorityAgreement)
 }
 
 // ParseConsensus parses a Tor consensus document from a reader.
