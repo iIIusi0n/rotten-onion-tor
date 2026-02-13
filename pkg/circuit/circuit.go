@@ -68,6 +68,9 @@ func (c *Circuit) Create(router *directory.Router) error {
 	if err != nil {
 		return fmt.Errorf("compute node ID: %w", err)
 	}
+	if len(router.NtorOnionKey) != 32 {
+		return fmt.Errorf("invalid ntor onion key length: %d", len(router.NtorOnionKey))
+	}
 
 	var ntorPK torcrypto.NtorPublicKey
 	copy(ntorPK[:], router.NtorOnionKey)
@@ -136,6 +139,9 @@ func (c *Circuit) Extend(router *directory.Router) error {
 	nodeID, err := computeNodeID(router)
 	if err != nil {
 		return fmt.Errorf("compute node ID: %w", err)
+	}
+	if len(router.NtorOnionKey) != 32 {
+		return fmt.Errorf("invalid ntor onion key length: %d", len(router.NtorOnionKey))
 	}
 
 	var ntorPK torcrypto.NtorPublicKey
@@ -381,6 +387,11 @@ func (c *Circuit) recvRelayCell() (*cell.RelayCell, error) {
 					body[7] = 0
 					body[8] = 0
 
+					snapshot, err := c.hops[i].Backward.SnapshotDigest()
+					if err != nil {
+						return nil, fmt.Errorf("snapshot backward digest: %w", err)
+					}
+
 					c.hops[i].Backward.UpdateDigest(body)
 					expectedDigest := c.hops[i].Backward.DigestValue()
 					expected := binary.BigEndian.Uint32(expectedDigest[:4])
@@ -395,13 +406,10 @@ func (c *Circuit) recvRelayCell() (*cell.RelayCell, error) {
 						return rc, nil
 					}
 
-					// Digest didn't match; undo the digest update.
-					// Since we can't undo SHA-1, we need to re-initialize.
-					// This is a simplification; in practice, the recognized==0
-					// but wrong digest case is very rare (2^-16 probability).
-					// For now, continue to next hop.
-					// Note: This means our backward digest state is now wrong
-					// for this hop. In practice, this almost never happens.
+					if err := c.hops[i].Backward.RestoreDigest(snapshot); err != nil {
+						return nil, fmt.Errorf("restore backward digest: %w", err)
+					}
+
 					body[5] = byte(recvDigest >> 24)
 					body[6] = byte(recvDigest >> 16)
 					body[7] = byte(recvDigest >> 8)
@@ -552,6 +560,13 @@ func (c *Circuit) Channel() *channel.Channel {
 // This is used for extending to introduction points where we have link specs
 // from the HS descriptor rather than a Router object.
 func (c *Circuit) ExtendRaw(linkSpecs []byte, ntorPK []byte, nodeID torcrypto.NodeID) error {
+	if len(ntorPK) != 32 {
+		return fmt.Errorf("invalid ntor public key length: %d", len(ntorPK))
+	}
+	if nodeID == (torcrypto.NodeID{}) {
+		return fmt.Errorf("missing relay node identity for EXTEND2")
+	}
+
 	var pk torcrypto.NtorPublicKey
 	copy(pk[:], ntorPK)
 

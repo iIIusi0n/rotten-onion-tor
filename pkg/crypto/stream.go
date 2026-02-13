@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
+	"encoding"
 	"fmt"
 	"hash"
 
@@ -59,6 +60,24 @@ func (rc *RelayCrypto) DigestValue() []byte {
 	// We need to get the digest without resetting the running state.
 	// hash.Hash.Sum(nil) appends the current hash to nil, without modifying state.
 	return rc.digest.Sum(nil)
+}
+
+// SnapshotDigest returns a serialized snapshot of the running digest state.
+func (rc *RelayCrypto) SnapshotDigest() ([]byte, error) {
+	m, ok := rc.digest.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, fmt.Errorf("digest does not support snapshotting")
+	}
+	return m.MarshalBinary()
+}
+
+// RestoreDigest restores a previously snapshotted running digest state.
+func (rc *RelayCrypto) RestoreDigest(snapshot []byte) error {
+	u, ok := rc.digest.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return fmt.Errorf("digest does not support restore")
+	}
+	return u.UnmarshalBinary(snapshot)
 }
 
 // NewRelayCryptoSHA3 creates a RelayCrypto using AES-256-CTR + SHA3-256.

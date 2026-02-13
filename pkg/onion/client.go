@@ -250,7 +250,7 @@ func buildRendezvousCircuit(consensus *directory.Consensus, logger *log.Logger) 
 
 	// Connect and build circuit.
 	addr := fmt.Sprintf("%s:%d", guard.Address, guard.ORPort)
-	ch, err := channel.Dial(addr, 30*time.Second)
+	ch, err := channel.DialWithIdentity(addr, 30*time.Second, guard.Identity)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to guard: %w", err)
 	}
@@ -411,7 +411,7 @@ func buildIntroCircuit(consensus *directory.Consensus, ip *IntroPoint, logger *l
 	}
 
 	addr := fmt.Sprintf("%s:%d", guard.Address, guard.ORPort)
-	ch, err := channel.Dial(addr, 30*time.Second)
+	ch, err := channel.DialWithIdentity(addr, 30*time.Second, guard.Identity)
 	if err != nil {
 		return nil, fmt.Errorf("connect to guard: %w", err)
 	}
@@ -435,7 +435,12 @@ func buildIntroCircuit(consensus *directory.Consensus, ip *IntroPoint, logger *l
 
 	// Extend to intro point using raw link specifiers.
 	// We need to find the intro point's NodeID from link specifiers.
-	nodeID := extractNodeID(ip.LinkSpecifiers)
+	nodeID, err := extractNodeID(ip.LinkSpecifiers)
+	if err != nil {
+		circ.Destroy()
+		ch.Close()
+		return nil, fmt.Errorf("extract intro point node ID: %w", err)
+	}
 	linkSpecBuf := EncodeLinkSpecifiers(ip.LinkSpecifiers)
 
 	logger.Printf("[HS] Extending to intro point via link specifiers")
@@ -450,15 +455,15 @@ func buildIntroCircuit(consensus *directory.Consensus, ip *IntroPoint, logger *l
 }
 
 // extractNodeID extracts the legacy identity (type 0x02) from link specifiers.
-func extractNodeID(specs []LinkSpecifier) torcrypto.NodeID {
+func extractNodeID(specs []LinkSpecifier) (torcrypto.NodeID, error) {
 	var id torcrypto.NodeID
 	for _, s := range specs {
 		if s.Type == 0x02 && len(s.Data) == 20 {
 			copy(id[:], s.Data)
-			return id
+			return id, nil
 		}
 	}
-	return id
+	return id, fmt.Errorf("legacy identity (type 0x02) not present in intro point link specifiers")
 }
 
 // buildRendLinkSpecs builds link specifiers for the rendezvous point.
@@ -540,7 +545,7 @@ func fetchDescriptorViaCircuit(consensus *directory.Consensus, hsdir *directory.
 
 	// Build 3-hop circuit: guard -> middle -> HSDir.
 	addr := fmt.Sprintf("%s:%d", guard.Address, guard.ORPort)
-	ch, err := channel.Dial(addr, 30*time.Second)
+	ch, err := channel.DialWithIdentity(addr, 30*time.Second, guard.Identity)
 	if err != nil {
 		return "", fmt.Errorf("connect to guard: %w", err)
 	}
