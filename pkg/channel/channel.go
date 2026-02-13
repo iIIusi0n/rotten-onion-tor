@@ -7,8 +7,11 @@ package channel
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -21,6 +24,7 @@ import (
 	"time"
 
 	"rotten-onion-tor/pkg/cell"
+	torcrypto "rotten-onion-tor/pkg/crypto"
 )
 
 // Channel represents a Tor channel (TLS connection to a relay).
@@ -34,6 +38,15 @@ type Channel struct {
 	// (SHA1 hash of DER-encoded RSA identity key), or nil if unset.
 	expectedRelayID []byte
 }
+
+const (
+	certsTypeLink       = 1
+	certsTypeID         = 2
+	certsTypeAuthEd     = 4
+	certsTypeLinkEd     = 5
+	certsTypeRSAToEd    = 7
+	rsaEdCrossCertMagic = "Tor TLS RSA/Ed25519 cross-certificate"
+)
 
 // Dial establishes a TLS connection to a Tor relay and performs
 // the channel negotiation handshake.
@@ -272,11 +285,11 @@ func (ch *Channel) validateCerts(payload []byte) error {
 		return err
 	}
 
-	linkDER, ok := entries[1] // CERTS_TYPE_LINK
+	linkDER, ok := entries[certsTypeLink]
 	if !ok {
 		return errors.New("CERTS missing link certificate (type 1)")
 	}
-	idDER, ok := entries[2] // CERTS_TYPE_ID
+	idDER, ok := entries[certsTypeID]
 	if !ok {
 		return errors.New("CERTS missing identity certificate (type 2)")
 	}
@@ -294,6 +307,13 @@ func (ch *Channel) validateCerts(payload []byte) error {
 	idCert, err := x509.ParseCertificate(idDER)
 	if err != nil {
 		return fmt.Errorf("parse identity cert: %w", err)
+	}
+	now := time.Now().UTC()
+	if err := checkX509Validity(linkCert, now); err != nil {
+		return fmt.Errorf("link cert validity: %w", err)
+	}
+	if err := checkX509Validity(idCert, now); err != nil {
+		return fmt.Errorf("identity cert validity: %w", err)
 	}
 	if err := linkCert.CheckSignatureFrom(idCert); err != nil {
 		// Tor relay identity certs are often not CA certificates by X.509 policy.
@@ -317,7 +337,123 @@ func (ch *Channel) validateCerts(payload []byte) error {
 		return errors.New("relay identity mismatch")
 	}
 
+	if err := ch.validateModernEd25519Chain(entries, idPubKey, linkDER, now); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func checkX509Validity(cert *x509.Certificate, now time.Time) error {
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("not yet valid until %s", cert.NotBefore.Format(time.RFC3339))
+	}
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("expired at %s", cert.NotAfter.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func (ch *Channel) validateModernEd25519Chain(entries map[byte][]byte, idPubKey *rsa.PublicKey, linkDER []byte, now time.Time) error {
+	authEd, hasAuthEd := entries[certsTypeAuthEd]
+	linkEd, hasLinkEd := entries[certsTypeLinkEd]
+	cross, hasCross := entries[certsTypeRSAToEd]
+
+	if !hasAuthEd && !hasLinkEd && !hasCross {
+		// Some relays may still only provide the legacy RSA chain.
+		return nil
+	}
+	if !hasAuthEd || !hasLinkEd || !hasCross {
+		return fmt.Errorf("incomplete ed25519 CERTS chain: need types 4,5,7")
+	}
+
+	edIdentity, err := validateRSAToEdCrossCert(cross, idPubKey, now)
+	if err != nil {
+		return fmt.Errorf("validate RSA->Ed cross-cert (type 7): %w", err)
+	}
+
+	authCert, err := torcrypto.ParseEd25519Cert(authEd)
+	if err != nil {
+		return fmt.Errorf("parse CERTS type 4: %w", err)
+	}
+	if authCert.CertType != certsTypeAuthEd {
+		return fmt.Errorf("CERTS type 4 has unexpected cert type %d", authCert.CertType)
+	}
+	if authCert.KeyType != 1 {
+		return fmt.Errorf("CERTS type 4 has unexpected key type %d", authCert.KeyType)
+	}
+	if err := authCert.Verify(edIdentity, now); err != nil {
+		return fmt.Errorf("verify CERTS type 4: %w", err)
+	}
+
+	relaySigningKey := make([]byte, ed25519.PublicKeySize)
+	copy(relaySigningKey, authCert.CertifiedKey[:])
+
+	linkCert, err := torcrypto.ParseEd25519Cert(linkEd)
+	if err != nil {
+		return fmt.Errorf("parse CERTS type 5: %w", err)
+	}
+	if linkCert.CertType != certsTypeLinkEd {
+		return fmt.Errorf("CERTS type 5 has unexpected cert type %d", linkCert.CertType)
+	}
+	if err := linkCert.Verify(relaySigningKey, now); err != nil {
+		return fmt.Errorf("verify CERTS type 5: %w", err)
+	}
+
+	expectedDigest := sha256.Sum256(linkDER)
+	if !bytes.Equal(linkCert.CertifiedKey[:], expectedDigest[:]) {
+		return fmt.Errorf("CERTS type 5 does not match link certificate digest")
+	}
+	return nil
+}
+
+func validateRSAToEdCrossCert(raw []byte, idPubKey *rsa.PublicKey, now time.Time) ([]byte, error) {
+	// CERTS type 7 format:
+	// ED25519_KEY(32) | EXPIRATION_HOURS(4) | SIGLEN(1) | SIG(SIGLEN)
+	if len(raw) < 32+4+1 {
+		return nil, fmt.Errorf("cross-cert too short: %d", len(raw))
+	}
+	edKey := make([]byte, ed25519.PublicKeySize)
+	copy(edKey, raw[:32])
+
+	expHours := binary.BigEndian.Uint32(raw[32:36])
+	expires := time.Unix(int64(expHours)*3600, 0).UTC()
+	if now.After(expires) {
+		return nil, fmt.Errorf("cross-cert expired at %s", expires.Format(time.RFC3339))
+	}
+
+	sigLen := int(raw[36])
+	if sigLen <= 0 || 37+sigLen != len(raw) {
+		return nil, fmt.Errorf("invalid cross-cert signature length %d", sigLen)
+	}
+	sig := raw[37:]
+
+	msgWithSigLen := make([]byte, 0, len(rsaEdCrossCertMagic)+37)
+	msgWithSigLen = append(msgWithSigLen, []byte(rsaEdCrossCertMagic)...)
+	msgWithSigLen = append(msgWithSigLen, raw[:37]...)
+	digestWithSigLen := sha256.Sum256(msgWithSigLen)
+
+	msgNoSigLen := make([]byte, 0, len(rsaEdCrossCertMagic)+36)
+	msgNoSigLen = append(msgNoSigLen, []byte(rsaEdCrossCertMagic)...)
+	msgNoSigLen = append(msgNoSigLen, raw[:36]...)
+	digestNoSigLen := sha256.Sum256(msgNoSigLen)
+
+	if !verifyRSASHA256Compat(idPubKey, digestWithSigLen[:], sig) &&
+		!verifyRSASHA256Compat(idPubKey, digestNoSigLen[:], sig) {
+		return nil, fmt.Errorf("verify cross-cert signature: no supported verification path matched")
+	}
+
+	return edKey, nil
+}
+
+func verifyRSASHA256Compat(pub *rsa.PublicKey, digest, sig []byte) bool {
+	if err := torcrypto.VerifyRSAPKCS1v15NoOID(pub, digest, sig); err == nil {
+		return true
+	}
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest, sig); err == nil {
+		return true
+	}
+	return false
 }
 
 func parseCertsPayload(payload []byte) (map[byte][]byte, error) {
