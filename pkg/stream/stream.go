@@ -214,13 +214,12 @@ func (s *Stream) Read(m *Manager, p []byte) (int, error) {
 func (s *Stream) Write(m *Manager, p []byte) (int, error) {
 	written := 0
 	for written < len(p) {
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			return written, io.EOF
+		if err := s.waitForPackageWindow(m); err != nil {
+			if errors.Is(err, io.EOF) {
+				return written, io.EOF
+			}
+			return written, err
 		}
-		s.packageWindow--
-		s.mu.Unlock()
 
 		// Max data per relay cell.
 		chunkSize := cell.RelayBodyLen
@@ -239,6 +238,42 @@ func (s *Stream) Write(m *Manager, p []byte) (int, error) {
 
 func (s *Stream) sendStreamSendme() error {
 	return s.circuit.SendRelayStreamSendme(s.streamID)
+}
+
+func (s *Stream) waitForPackageWindow(m *Manager) error {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return io.EOF
+		}
+		if s.packageWindow > 0 {
+			s.packageWindow--
+			s.mu.Unlock()
+			return nil
+		}
+		s.mu.Unlock()
+
+		rc, err := s.nextEvent(m)
+		if err != nil {
+			return err
+		}
+
+		switch rc.Command {
+		case cell.RelaySendme:
+			s.mu.Lock()
+			s.packageWindow += streamSendmeIncrement
+			s.mu.Unlock()
+		case cell.RelayData:
+			s.mu.Lock()
+			s.buf = append(s.buf, rc.Data...)
+			s.mu.Unlock()
+		case cell.RelayEnd:
+			s.mu.Lock()
+			s.closed = true
+			s.mu.Unlock()
+		}
+	}
 }
 
 // StreamID returns the stream ID.
