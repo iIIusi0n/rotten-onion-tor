@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
+	"time"
 
 	"rotten-onion-tor/pkg/cell"
 	"rotten-onion-tor/pkg/circuit"
@@ -162,6 +164,11 @@ func (m *Manager) handleCircuitCell(rc *cell.RelayCell) {
 
 // Read reads data from the stream.
 func (s *Stream) Read(m *Manager, p []byte) (int, error) {
+	return s.ReadWithDeadline(m, p, time.Time{})
+}
+
+// ReadWithDeadline reads data from the stream, honoring an optional deadline.
+func (s *Stream) ReadWithDeadline(m *Manager, p []byte, deadline time.Time) (int, error) {
 	for {
 		s.mu.Lock()
 		if len(s.buf) > 0 {
@@ -185,7 +192,7 @@ func (s *Stream) Read(m *Manager, p []byte) (int, error) {
 		}
 		s.mu.Unlock()
 
-		rc, err := s.nextEvent(m)
+		rc, err := s.nextEventWithDeadline(m, deadline)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return 0, io.EOF
@@ -212,9 +219,14 @@ func (s *Stream) Read(m *Manager, p []byte) (int, error) {
 
 // Write sends data through the stream.
 func (s *Stream) Write(m *Manager, p []byte) (int, error) {
+	return s.WriteWithDeadline(m, p, time.Time{})
+}
+
+// WriteWithDeadline writes data to the stream, honoring an optional deadline.
+func (s *Stream) WriteWithDeadline(m *Manager, p []byte, deadline time.Time) (int, error) {
 	written := 0
 	for written < len(p) {
-		if err := s.waitForPackageWindow(m); err != nil {
+		if err := s.waitForPackageWindowWithDeadline(m, deadline); err != nil {
 			if errors.Is(err, io.EOF) {
 				return written, io.EOF
 			}
@@ -241,6 +253,10 @@ func (s *Stream) sendStreamSendme() error {
 }
 
 func (s *Stream) waitForPackageWindow(m *Manager) error {
+	return s.waitForPackageWindowWithDeadline(m, time.Time{})
+}
+
+func (s *Stream) waitForPackageWindowWithDeadline(m *Manager, deadline time.Time) error {
 	for {
 		s.mu.Lock()
 		if s.closed {
@@ -254,7 +270,7 @@ func (s *Stream) waitForPackageWindow(m *Manager) error {
 		}
 		s.mu.Unlock()
 
-		rc, err := s.nextEvent(m)
+		rc, err := s.nextEventWithDeadline(m, deadline)
 		if err != nil {
 			return err
 		}
@@ -298,15 +314,36 @@ func (s *Stream) Close(m *Manager) error {
 }
 
 func (s *Stream) nextEvent(m *Manager) (*cell.RelayCell, error) {
-	rc, ok := <-s.events
-	if ok {
-		return rc, nil
+	return s.nextEventWithDeadline(m, time.Time{})
+}
+
+func (s *Stream) nextEventWithDeadline(m *Manager, deadline time.Time) (*cell.RelayCell, error) {
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return nil, os.ErrDeadlineExceeded
 	}
 
-	if err := m.readError(); err != nil {
-		return nil, err
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		timer = time.NewTimer(time.Until(deadline))
+		timeout = timer.C
 	}
-	return nil, io.EOF
+	if timer != nil {
+		defer timer.Stop()
+	}
+
+	select {
+	case rc, ok := <-s.events:
+		if ok {
+			return rc, nil
+		}
+		if err := m.readError(); err != nil {
+			return nil, err
+		}
+		return nil, io.EOF
+	case <-timeout:
+		return nil, os.ErrDeadlineExceeded
+	}
 }
 
 func (m *Manager) allocateStreamIDLocked() (uint16, error) {
