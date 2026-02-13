@@ -32,7 +32,17 @@ type Circuit struct {
 	// Flow control
 	packageWindow int // cells we can send
 	deliverWindow int // cells we're willing to receive
+
+	relayEarlyCount int
 }
+
+const (
+	defaultCircuitPackageWindow = 1000
+	defaultCircuitDeliverWindow = 1000
+	circuitSendmeIncrement      = 100
+	circuitSendmeThreshold      = defaultCircuitDeliverWindow - circuitSendmeIncrement
+	maxRelayEarlyCells          = 8
+)
 
 // New creates a new circuit object on the given channel.
 func New(ch *channel.Channel) (*Circuit, error) {
@@ -44,8 +54,8 @@ func New(ch *channel.Channel) (*Circuit, error) {
 	return &Circuit{
 		channel:       ch,
 		circID:        circID,
-		packageWindow: 1000,
-		deliverWindow: 1000,
+		packageWindow: defaultCircuitPackageWindow,
+		deliverWindow: defaultCircuitDeliverWindow,
 	}, nil
 }
 
@@ -325,6 +335,20 @@ func (c *Circuit) sendRelayCell(cmd cell.RelayCommand, streamID uint16, data []b
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if early {
+		if c.relayEarlyCount >= maxRelayEarlyCells {
+			return fmt.Errorf("RELAY_EARLY limit exceeded (%d)", maxRelayEarlyCells)
+		}
+		c.relayEarlyCount++
+	}
+
+	if cmd == cell.RelayData {
+		if c.packageWindow <= 0 {
+			return fmt.Errorf("circuit package window exhausted")
+		}
+		c.packageWindow--
+	}
+
 	rc := &cell.RelayCell{
 		Command:    cmd,
 		Recognized: 0,
@@ -370,6 +394,9 @@ func (c *Circuit) recvRelayCell() (*cell.RelayCell, error) {
 
 		switch msg.Command {
 		case cell.CommandRelay, cell.CommandRelayEarly:
+			if msg.Command == cell.CommandRelayEarly {
+				return nil, fmt.Errorf("unexpected RELAY_EARLY cell from relay")
+			}
 			// Decrypt onion layers.
 			body := msg.Payload
 			for i := 0; i < len(c.hops); i++ {
@@ -403,6 +430,7 @@ func (c *Circuit) recvRelayCell() (*cell.RelayCell, error) {
 						if err != nil {
 							return nil, err
 						}
+						c.applyInboundFlowControl(rc)
 						return rc, nil
 					}
 
@@ -432,6 +460,32 @@ func (c *Circuit) recvRelayCell() (*cell.RelayCell, error) {
 			// Ignore unexpected cell types during relay communication.
 			continue
 		}
+	}
+}
+
+func (c *Circuit) applyInboundFlowControl(rc *cell.RelayCell) {
+	if rc == nil {
+		return
+	}
+	if rc.StreamID == 0 && rc.Command == cell.RelaySendme {
+		c.OnCircuitSendme()
+		return
+	}
+	if rc.Command != cell.RelayData {
+		return
+	}
+
+	shouldSend := false
+	c.mu.Lock()
+	c.deliverWindow--
+	if c.deliverWindow <= circuitSendmeThreshold {
+		c.deliverWindow += circuitSendmeIncrement
+		shouldSend = true
+	}
+	c.mu.Unlock()
+
+	if shouldSend {
+		_ = c.SendRelaySendme()
 	}
 }
 
@@ -502,6 +556,13 @@ func (c *Circuit) SendRelaySendme() error {
 	return c.sendRelayCell(cell.RelaySendme, 0, data, false)
 }
 
+// OnCircuitSendme applies a received circuit-level SENDME to package window state.
+func (c *Circuit) OnCircuitSendme() {
+	c.mu.Lock()
+	c.packageWindow += circuitSendmeIncrement
+	c.mu.Unlock()
+}
+
 // RecvRelayCell reads and decrypts a relay cell.
 func (c *Circuit) RecvRelayCell() (*cell.RelayCell, error) {
 	return c.recvRelayCell()
@@ -523,6 +584,12 @@ func (c *Circuit) Destroy() error {
 		Payload: payload,
 	}
 	return c.channel.SendCell(destroyCell)
+}
+
+// Close tears down the circuit and closes the underlying channel.
+func (c *Circuit) Close() error {
+	_ = c.Destroy()
+	return c.channel.Close()
 }
 
 // HSCircuitKeys holds AES-256 keys + SHA3-256 digest seeds for an HS hop.
