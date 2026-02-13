@@ -83,6 +83,10 @@ func ConnectOnion(consensus *directory.Consensus, onionAddr string, logger *log.
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse descriptor: %w", err)
 	}
+	descriptorSigningKey, err := VerifyOuterDescriptor(desc, blindedKey, time.Now().UTC())
+	if err != nil {
+		return nil, nil, fmt.Errorf("verify descriptor outer signature: %w", err)
+	}
 	logger.Printf("[HS] Revision counter: %d", desc.RevisionCounter)
 
 	// Decrypt layer 1 (superencrypted).
@@ -106,7 +110,7 @@ func ConnectOnion(consensus *directory.Consensus, onionAddr string, logger *log.
 	logger.Printf("[HS] Second layer decrypted (%d bytes)", len(secondLayer))
 
 	// Parse intro points.
-	introPoints, err := ParseIntroPoints(secondLayer)
+	introPoints, err := ParseIntroPoints(secondLayer, descriptorSigningKey, time.Now().UTC())
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse intro points: %w", err)
 	}
@@ -297,7 +301,7 @@ func doIntroduction(
 	if err != nil {
 		return nil, nil, fmt.Errorf("build intro circuit: %w", err)
 	}
-	defer introCirc.Destroy()
+	defer introCirc.Close()
 
 	// Create hs-ntor state.
 	hsState, err := NewHSNtorClient(ip.EncKey, ip.AuthKey, subcredential)
@@ -555,8 +559,7 @@ func fetchDescriptorViaCircuit(consensus *directory.Consensus, hsdir *directory.
 		ch.Close()
 		return "", fmt.Errorf("create circuit: %w", err)
 	}
-	defer circ.Destroy()
-	defer ch.Close()
+	defer circ.Close()
 
 	if err := circ.Create(guard); err != nil {
 		return "", fmt.Errorf("CREATE to guard: %w", err)
