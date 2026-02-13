@@ -92,7 +92,7 @@ func (c *Client) BuildCircuit() (*circuit.Circuit, *stream.Manager, *CircuitInfo
 	// Connect to guard relay via TLS.
 	addr := fmt.Sprintf("%s:%d", guard.Address, guard.ORPort)
 	c.logger.Printf("[*] Connecting to guard relay %s at %s...", guard.Nickname, addr)
-	ch, err := channel.Dial(addr, 30*time.Second)
+	ch, err := channel.DialWithIdentity(addr, 30*time.Second, guard.Identity)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect to guard: %w", err)
 	}

@@ -6,8 +6,14 @@
 package channel
 
 import (
+	"bytes"
+	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,11 +29,33 @@ type Channel struct {
 	version  uint16
 	mu       sync.Mutex
 	peerCert []byte // DER-encoded peer TLS certificate
+
+	// expectedRelayID is the expected legacy relay identity
+	// (SHA1 hash of DER-encoded RSA identity key), or nil if unset.
+	expectedRelayID []byte
 }
 
 // Dial establishes a TLS connection to a Tor relay and performs
 // the channel negotiation handshake.
 func Dial(address string, timeout time.Duration) (*Channel, error) {
+	return dial(address, timeout, nil)
+}
+
+// DialWithIdentity establishes a TLS connection to a Tor relay and verifies
+// the peer against the expected relay identity from consensus.
+func DialWithIdentity(address string, timeout time.Duration, relayIdentity string) (*Channel, error) {
+	expectedID, err := decodeRelayIdentity(relayIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("decode relay identity: %w", err)
+	}
+	return dial(address, timeout, expectedID)
+}
+
+func dial(address string, timeout time.Duration, expectedRelayID []byte) (*Channel, error) {
+	if expectedRelayID != nil && len(expectedRelayID) != 20 {
+		return nil, fmt.Errorf("expected relay identity length = %d, want 20", len(expectedRelayID))
+	}
+
 	dialer := net.Dialer{Timeout: timeout}
 	rawConn, err := dialer.Dial("tcp", address)
 	if err != nil {
@@ -53,8 +81,9 @@ func Dial(address string, timeout time.Duration) (*Channel, error) {
 	}
 
 	ch := &Channel{
-		conn:     tlsConn,
-		peerCert: peerCert,
+		conn:            tlsConn,
+		peerCert:        peerCert,
+		expectedRelayID: append([]byte(nil), expectedRelayID...),
 	}
 
 	// Perform versions negotiation.
@@ -106,10 +135,10 @@ func (ch *Channel) negotiate() error {
 
 		switch c.Command {
 		case cell.CommandCerts:
+			if err := ch.validateCerts(c.Payload); err != nil {
+				return fmt.Errorf("validate CERTS: %w", err)
+			}
 			gotCerts = true
-			// We accept the CERTS cell but don't fully validate the certificate chain.
-			// For a client that doesn't authenticate, this is acceptable.
-			// In production, we would verify the Ed25519 cert chain here.
 
 		case cell.CommandAuthChallenge:
 			gotAuthChallenge = true
@@ -126,8 +155,12 @@ func (ch *Channel) negotiate() error {
 		}
 	}
 
-	_ = gotCerts
-	_ = gotAuthChallenge
+	if !gotCerts {
+		return errors.New("missing CERTS cell during negotiation")
+	}
+	if !gotAuthChallenge {
+		return errors.New("missing AUTH_CHALLENGE cell during negotiation")
+	}
 
 	// Send our NETINFO cell.
 	if err := ch.sendNetinfo(); err != nil {
@@ -217,4 +250,113 @@ func (ch *Channel) PeerCert() []byte {
 // Conn returns the underlying TLS connection for direct I/O if needed.
 func (ch *Channel) Conn() io.ReadWriter {
 	return ch.conn
+}
+
+func decodeRelayIdentity(identity string) ([]byte, error) {
+	decoded, err := base64.RawStdEncoding.DecodeString(identity)
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(identity)
+		if err != nil {
+			return nil, fmt.Errorf("base64 decode relay identity: %w", err)
+		}
+	}
+	if len(decoded) != 20 {
+		return nil, fmt.Errorf("relay identity length = %d, want 20", len(decoded))
+	}
+	return decoded, nil
+}
+
+func (ch *Channel) validateCerts(payload []byte) error {
+	entries, err := parseCertsPayload(payload)
+	if err != nil {
+		return err
+	}
+
+	linkDER, ok := entries[1] // CERTS_TYPE_LINK
+	if !ok {
+		return errors.New("CERTS missing link certificate (type 1)")
+	}
+	idDER, ok := entries[2] // CERTS_TYPE_ID
+	if !ok {
+		return errors.New("CERTS missing identity certificate (type 2)")
+	}
+	if len(ch.peerCert) == 0 {
+		return errors.New("no TLS peer certificate available")
+	}
+	if !bytes.Equal(ch.peerCert, linkDER) {
+		return errors.New("TLS peer cert does not match CERTS link certificate")
+	}
+
+	linkCert, err := x509.ParseCertificate(linkDER)
+	if err != nil {
+		return fmt.Errorf("parse link cert: %w", err)
+	}
+	idCert, err := x509.ParseCertificate(idDER)
+	if err != nil {
+		return fmt.Errorf("parse identity cert: %w", err)
+	}
+	if err := linkCert.CheckSignatureFrom(idCert); err != nil {
+		// Tor relay identity certs are often not CA certificates by X.509 policy.
+		// Verify the signature directly with the identity key instead of enforcing
+		// CA/key-usage constraints from CheckSignatureFrom.
+		if err := idCert.CheckSignature(linkCert.SignatureAlgorithm, linkCert.RawTBSCertificate, linkCert.Signature); err != nil {
+			return fmt.Errorf("link cert not signed by identity cert: %w", err)
+		}
+	}
+	if err := idCert.CheckSignature(idCert.SignatureAlgorithm, idCert.RawTBSCertificate, idCert.Signature); err != nil {
+		return fmt.Errorf("identity cert signature invalid: %w", err)
+	}
+
+	idPubKey, ok := idCert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("identity cert public key is %T, want RSA", idCert.PublicKey)
+	}
+	legacyID := sha1.Sum(x509.MarshalPKCS1PublicKey(idPubKey))
+
+	if len(ch.expectedRelayID) == 20 && !bytes.Equal(legacyID[:], ch.expectedRelayID) {
+		return errors.New("relay identity mismatch")
+	}
+
+	return nil
+}
+
+func parseCertsPayload(payload []byte) (map[byte][]byte, error) {
+	if len(payload) < 1 {
+		return nil, errors.New("CERTS payload too short")
+	}
+
+	nCerts := int(payload[0])
+	off := 1
+	entries := make(map[byte][]byte, nCerts)
+
+	for i := 0; i < nCerts; i++ {
+		if off+3 > len(payload) {
+			return nil, fmt.Errorf("CERTS truncated at cert %d header", i)
+		}
+
+		certType := payload[off]
+		certLen := int(binary.BigEndian.Uint16(payload[off+1 : off+3]))
+		off += 3
+
+		if certLen <= 0 {
+			return nil, fmt.Errorf("CERTS cert %d has invalid length %d", i, certLen)
+		}
+		if off+certLen > len(payload) {
+			return nil, fmt.Errorf("CERTS truncated at cert %d body", i)
+		}
+
+		certDER := make([]byte, certLen)
+		copy(certDER, payload[off:off+certLen])
+		off += certLen
+
+		if _, exists := entries[certType]; !exists {
+			entries[certType] = certDER
+		}
+	}
+
+	if off != len(payload) {
+		return nil, fmt.Errorf("CERTS has %d trailing bytes", len(payload)-off)
+	}
+
+	return entries, nil
 }
