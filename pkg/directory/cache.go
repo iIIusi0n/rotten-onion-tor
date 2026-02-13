@@ -13,6 +13,7 @@ type CachedConsensus struct {
 	ValidAfter         time.Time      `json:"valid_after"`
 	FreshUntil         time.Time      `json:"fresh_until"`
 	ValidUntil         time.Time      `json:"valid_until"`
+	Verified           bool           `json:"verified"`
 	SharedRandCurrent  []byte         `json:"shared_rand_current,omitempty"`
 	SharedRandPrevious []byte         `json:"shared_rand_previous,omitempty"`
 	Routers            []CachedRouter `json:"routers"`
@@ -20,18 +21,19 @@ type CachedConsensus struct {
 
 // CachedRouter is the JSON-serializable form of a Router.
 type CachedRouter struct {
-	Nickname        string         `json:"nickname"`
-	Identity        string         `json:"identity"`
-	Digest          string         `json:"digest,omitempty"`
-	MicrodescDigest string         `json:"microdesc_digest,omitempty"`
-	Address         string         `json:"address"`
-	ORPort          uint16         `json:"or_port"`
-	DirPort         uint16         `json:"dir_port"`
-	Flags           []string       `json:"flags,omitempty"`
-	NtorOnionKey    []byte         `json:"ntor_onion_key,omitempty"`
-	Ed25519Identity []byte         `json:"ed25519_identity,omitempty"`
-	Bandwidth       int            `json:"bandwidth"`
+	Nickname        string           `json:"nickname"`
+	Identity        string           `json:"identity"`
+	Digest          string           `json:"digest,omitempty"`
+	MicrodescDigest string           `json:"microdesc_digest,omitempty"`
+	Address         string           `json:"address"`
+	ORPort          uint16           `json:"or_port"`
+	DirPort         uint16           `json:"dir_port"`
+	Flags           []string         `json:"flags,omitempty"`
+	NtorOnionKey    []byte           `json:"ntor_onion_key,omitempty"`
+	Ed25519Identity []byte           `json:"ed25519_identity,omitempty"`
+	Bandwidth       int              `json:"bandwidth"`
 	Protocols       map[string][]int `json:"protocols,omitempty"`
+	Family          []string         `json:"family,omitempty"`
 }
 
 // CacheDir returns the path to the cache directory (~/.rotten-tor-cache/),
@@ -52,6 +54,7 @@ func SaveConsensus(c *Consensus) error {
 		ValidAfter:         c.ValidAfter,
 		FreshUntil:         c.FreshUntil,
 		ValidUntil:         c.ValidUntil,
+		Verified:           c.Verified,
 		SharedRandCurrent:  c.SharedRandCurrent,
 		SharedRandPrevious: c.SharedRandPrevious,
 		Routers:            make([]CachedRouter, len(c.Routers)),
@@ -70,6 +73,7 @@ func SaveConsensus(c *Consensus) error {
 			Ed25519Identity: r.Ed25519Identity,
 			Bandwidth:       r.Bandwidth,
 			Protocols:       r.Protocols,
+			Family:          r.Family,
 		}
 	}
 
@@ -96,14 +100,25 @@ func LoadConsensus() (*Consensus, error) {
 		return nil, fmt.Errorf("unmarshal consensus cache: %w", err)
 	}
 
-	if time.Now().UTC().After(cached.ValidUntil) {
+	now := time.Now().UTC()
+	if now.After(cached.ValidUntil) {
 		return nil, fmt.Errorf("cached consensus expired (valid until %s)", cached.ValidUntil)
+	}
+	if !cached.ValidAfter.IsZero() && now.Before(cached.ValidAfter.Add(-10*time.Minute)) {
+		return nil, fmt.Errorf("cached consensus not yet valid (valid after %s)", cached.ValidAfter)
+	}
+	if !cached.ValidAfter.IsZero() && !cached.ValidUntil.IsZero() && !cached.ValidUntil.After(cached.ValidAfter) {
+		return nil, fmt.Errorf("cached consensus validity interval is invalid")
+	}
+	if !cached.Verified {
+		return nil, fmt.Errorf("cached consensus is not marked as signature-verified")
 	}
 
 	c := &Consensus{
 		ValidAfter:         cached.ValidAfter,
 		FreshUntil:         cached.FreshUntil,
 		ValidUntil:         cached.ValidUntil,
+		Verified:           cached.Verified,
 		SharedRandCurrent:  cached.SharedRandCurrent,
 		SharedRandPrevious: cached.SharedRandPrevious,
 		Routers:            make([]*Router, len(cached.Routers)),
@@ -122,6 +137,7 @@ func LoadConsensus() (*Consensus, error) {
 			Ed25519Identity: cr.Ed25519Identity,
 			Bandwidth:       cr.Bandwidth,
 			Protocols:       cr.Protocols,
+			Family:          cr.Family,
 		}
 	}
 
